@@ -74,7 +74,7 @@ DataConnection.prototype._configureDataChannel = function() {
     this._dc.binaryType = 'arraybuffer';
   }
   this._dc.onopen = function() {
-    util.log('Data channel connection success');
+    util.log('Data channel connection success', this);
     self.open = true;
     self.emit('open');
   }
@@ -157,6 +157,7 @@ DataConnection.prototype.close = function() {
   if (!this.open) {
     return;
   }
+  this.send()
   this.open = false;
   Negotiator.cleanup(this);
   this.emit('close');
@@ -441,6 +442,7 @@ Negotiator.startConnection = function(connection, options) {
       if (!util.supports.sctp) {
         config = {reliable: options.reliable};
       }
+      console.log("# createDataChannel with config", config);
       var dc = pc.createDataChannel(connection.label, config);
       connection.initialize(dc);
     }
@@ -554,14 +556,26 @@ Negotiator._setupListeners = function(connection, pc, pc_id) {
     }
   };
 
-  pc.oniceconnectionstatechange = function() {
+  pc.oniceconnectionstatechange = function () {
+    var self = this;
     switch (pc.iceConnectionState) {
+      case 'new':
+      case 'checking':
+      case 'connected':
+        util.log('pc.iceConnectionState: ' + pc.iceConnectionState, peerId);
+        break;
       case 'disconnected':
       case 'failed':
-        util.log('iceConnectionState is disconnected, closing connections to ' + peerId);
-        connection.close();
+      case 'closed':
+        util.warn('iceConnectionState is ' + pc.iceConnectionState + ', closing connections to ' + peerId);
+        if (connection.open) {
+          connection.close();
+        }
+        console.warn("[#peerjs]Add peer to list seeders nerver try in this session", peerId);
+        connection.provider.emitError('seeder-dead', peerId);
         break;
       case 'completed':
+        util.log('pc.iceConnectionState: ' + pc.iceConnectionState, peerId);
         pc.onicecandidate = util.noop;
         break;
     }
@@ -737,10 +751,16 @@ Negotiator.handleCandidate = function(connection, ice) {
   var candidate = ice.candidate;
   var sdpMLineIndex = ice.sdpMLineIndex;
   //var sdpMid = ice.sdpMid;
-  connection.pc.addIceCandidate(new RTCIceCandidate({
-    sdpMLineIndex: sdpMLineIndex,
-    candidate: candidate
-  }));
+  try {
+
+    connection.pc.addIceCandidate(new RTCIceCandidate({
+      sdpMLineIndex: sdpMLineIndex,
+      candidate: candidate
+    }));
+  } catch (e) {
+    console.error(e);
+  }
+
   util.log('Added ICE candidate for:', connection.peer);
 }
 
@@ -802,14 +822,15 @@ function Peer(id, options) {
 
   // Set whether we use SSL to same as current host unless hosted on skyway
   if (options.host === util.CLOUD_HOST) {
-    options.secure = true;
+    //options.secure = true; //FIXME
   } else if (options.secure === undefined) {
     options.secure = util.isSecure();
   }
   // Set whether the server supports WS keepalives
-  if (options.host === util.CLOUD_HOST) {
-      util.supportsKeepAlive = true;
-  } else if (options.keepalive) {
+  //if (options.host === util.CLOUD_HOST) {
+  //    util.supportsKeepAlive = true;
+  //} else
+  if (options.keepalive) {
       util.supportsKeepAlive = options.keepalive;
   }
   // Set a custom log function if present
@@ -929,6 +950,13 @@ Peer.prototype._retrieveId = function(id) {
   };
   http.onreadystatechange = function() {
     if (http.readyState !== 4) {
+      return;
+    }
+    //PCDN
+    if (http.readyState == 0) {
+      console.log("Tracker server went away");
+      http.onerror();
+      // Network error (i.e. connection refused, access denied due to CORS, etc.)
       return;
     }
     if (http.status !== 200) {
@@ -1332,7 +1360,7 @@ function Socket(secure, host, port, path, key) {
   var httpProtocol = secure ? 'https://' : 'http://';
   var wsProtocol = secure ? 'wss://' : 'ws://';
   this._httpUrl = httpProtocol + host + ':' + port + path + key;
-  this._wsUrl = wsProtocol + host + ':' + port + path + 'peerjs?key=' + key;
+  this._wsUrl = wsProtocol + host + ':' + port + path + '?key=' + key;
 }
 
 util.inherits(Socket, EventEmitter);
@@ -1340,6 +1368,7 @@ util.inherits(Socket, EventEmitter);
 
 /** Check in with ID or get one from server. */
 Socket.prototype.start = function(id, token) {
+  util.log("Check in with ID or get one from server", id, token);
   this.id = id;
 
   this._httpUrl += '/' + id + '/' + token;
@@ -1380,6 +1409,7 @@ Socket.prototype._startWebSocket = function(id) {
         self._http = null;
       }, 5000);
     }
+    util.log("supportsKeepAlive", util.supportsKeepAlive);
     if (util.supportsKeepAlive) {
       self._setWSTimeout();
     }
@@ -1411,6 +1441,7 @@ Socket.prototype._startXhrStream = function(n) {
     this._http.onerror = function() {
       // If we get an error, likely something went wrong.
       // Stop streaming.
+      util.error("We get an error, likely something went wrong. Stop streaming");
       clearTimeout(self._timeout);
       self.emit('disconnected');
     }
@@ -1483,7 +1514,7 @@ Socket.prototype._setHTTPTimeout = function() {
     } else {
       old.abort();
     }
-  }, 25000);
+  }, 2000);
 }
 
 Socket.prototype._setWSTimeout = function(){
@@ -1493,7 +1524,7 @@ Socket.prototype._setWSTimeout = function(){
             self._socket.close();
             util.error('WS timed out');
         }
-    }, 45000)
+    }, 4000)
 }
 
 /** Is the websocket currently open? */
@@ -1532,14 +1563,16 @@ Socket.prototype.send = function(data) {
   } else if(data.type !== 'PONG') {
     var http = new XMLHttpRequest();
     var url = this._httpUrl + '/' + data.type.toLowerCase();
+    util.log("#send xhr req", url);
     http.open('post', url, true);
-    http.setRequestHeader('Content-Type', 'application/json');
+    //http.setRequestHeader('Content-Type', 'application/json');
     http.send(message);
   }
 }
 
 Socket.prototype.sendPong = function() {
   if (this._wsOpen()) {
+    util.log("ws is open, send Pong");
     this.send({type:'PONG'});
     if (this._wsTimeout) {
       clearTimeout(this._wsTimeout);
@@ -1564,7 +1597,7 @@ Socket.prototype.close = function() {
 module.exports = Socket;
 
 },{"./util":8,"eventemitter3":9}],8:[function(require,module,exports){
-var defaultConfig = {'iceServers': [{ 'urls': 'stun:stun.skyway.io:3478' , 'url': 'stun:stun.skyway.io:3478'}]};
+var defaultConfig = {'iceServers': [{'urls': 'stun:stun.l.google.com:19302', 'url': 'stun:stun.skyway.io:3478'}]}; //FIXME: move out config
 var dataCount = 1;
 
 var BinaryPack = require('js-binarypack');
@@ -1573,10 +1606,11 @@ var RTCPeerConnection = require('./adapter').RTCPeerConnection;
 var util = {
   noop: function() {},
 
-  CLOUD_HOST: 'skyway.io',
-  CLOUD_PORT: 443,
-  TURN_HOST: 'turn.skyway.io',
-  TURN_PORT: 443,
+  ////FIXME: move out config
+  //CLOUD_HOST: '40.76.35.190',
+  //CLOUD_PORT: 8443,
+  //TURN_HOST: 'turn.skyway.io',
+  //TURN_PORT: 443,
 
   // Browsers that need chunking:
   chunkedBrowsers: {'Chrome': 1},
